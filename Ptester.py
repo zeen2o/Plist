@@ -1,7 +1,7 @@
 # proxy_tester_curl_multiport.py
 """
 Generate random IP addresses and test a list of common ports on each IP
-for proxy connectivity using curl.exe.
+for proxy connectivity using curl.
 
 Protocols Tested:
   - HTTP (http://httpbin.org/ip)
@@ -85,7 +85,7 @@ def save_working(proxy_str, proto_key):
             fh.write(proxy_str + "\n")
 
 def run_curl(args, timeout):
-    """Run curl.exe command, return True if successful (exit 0 and stdout)."""
+    """Run curl command, return True if successful (exit 0 and stdout)."""
     try:
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -99,19 +99,19 @@ def run_curl(args, timeout):
         return False
 
 def test_http_proxy(proxy_str, timeout):
-    args = ["curl.exe", "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "http://httpbin.org/ip"]
+    args = ["curl", "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "http://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_https_proxy(proxy_str, timeout):
-    args = ["curl.exe", "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "https://httpbin.org/ip"]
+    args = ["curl", "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_socks4_proxy(proxy_str, timeout):
-    args = ["curl.exe", "--socks4", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
+    args = ["curl", "--socks4", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_socks5_proxy(proxy_str, timeout):
-    args = ["curl.exe", "--socks5-hostname", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
+    args = ["curl", "--socks5-hostname", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 # ---------- IP generation (avoid private/multicast/reserved ranges) ----------
@@ -155,7 +155,7 @@ def worker_test(proxy_str, timeout):
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Generate random IPs and test multiple ports on each with curl.exe")
+    parser = argparse.ArgumentParser(description="Generate random IPs and test multiple ports on each with curl")
     parser.add_argument("--count", type=int, default=DEFAULT_IP_COUNT, help="Number of random IP addresses to generate and test")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Max concurrent workers")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Curl timeout in seconds")
