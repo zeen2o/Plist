@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Cross-platform proxy tester using curl (works on Windows and Ubuntu/GitHub Actions).
+Batching proxy tester (Ubuntu / Windows compatible)
 
-Writes outputs into the `results/` folder:
-  results/HTTP.txt
-  results/HTTPS.txt
-  results/SOCKS4.txt
-  results/SOCKS5.txt
-  results/ALL_WORKING.txt
+- DEFAULT_IP_COUNT = 100 per batch
+- Repeats batches until overall timeout (default 6h40m = 24000s)
+- Appends results to results/* files (does NOT remove old results)
+- Loads previous ALL_WORKING to avoid duplicates across runs
 """
 
 import os
@@ -19,12 +17,14 @@ import subprocess
 import shutil
 import platform
 import sys
+import time
+from datetime import datetime
 
 # ---------- Config / defaults ----------
-DEFAULT_IP_COUNT = 200
-DEFAULT_TIMEOUT = 3
-# Lowered default a bit for CI runners (adjust as needed)
-DEFAULT_MAX_WORKERS = 50
+DEFAULT_IP_COUNT = 100           # changed to 100 per your request
+DEFAULT_TIMEOUT = 3              # curl timeout per request
+DEFAULT_MAX_WORKERS = 50         # concurrency (reduce for CI)
+DEFAULT_OVERALL_TIMEOUT = 24000  # 6h40m in seconds (6*3600 + 40*60 = 24000)
 
 RESULTS_DIR = "results"
 
@@ -35,10 +35,10 @@ OUT_FILES = {
     "socks5": os.path.join(RESULTS_DIR, "SOCKS5.txt"),
 }
 ALL_WORKING_FILE = os.path.join(RESULTS_DIR, "ALL_WORKING.txt")
+SUMMARY_FILE = os.path.join(RESULTS_DIR, "summary.txt")
 
-# --- Port Lists ---
+# --- Port Lists (same as before) ---
 COMMON_PROXY_PORTS = [80, 8080, 3128, 1080, 9050, 8888, 8118, 8000]
-
 ALT_HTTP_PORTS = [
     81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 591, 7080, 7081, 7088, 7090, 7443, 8001,
     8002, 8008, 8010, 8020, 8030, 8040, 8050, 8060, 8070, 8090, 8091, 8100, 8111,
@@ -57,11 +57,10 @@ ALT_SOCKS_PORTS = [
 ALL_COMMON_PORTS = sorted(list(set(COMMON_PROXY_PORTS + ALT_HTTP_PORTS + ALT_SOCKS_PORTS)))
 
 lock = threading.Lock()
-unique_proxies_found = set()
+unique_proxies_found = set()  # loaded from existing ALL_WORKING at start
 
 # ---------- Platform / curl detection ----------
 IS_WINDOWS = platform.system().lower().startswith("windows")
-# prefer native curl if available
 CURL_CANDIDATES = ["curl", "curl.exe"]
 curl_exe = None
 for c in CURL_CANDIDATES:
@@ -72,28 +71,35 @@ for c in CURL_CANDIDATES:
 
 if not curl_exe:
     print("Error: curl not found on PATH. Please install curl on the runner (e.g. apt-get install -y curl).", file=sys.stderr)
-    # Exit non-zero so CI shows failure — user can change this behavior
     sys.exit(2)
 
 # ---------- Helpers ----------
 def ensure_results_dir():
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-def clear_output_files():
+def load_existing_proxies():
+    """Load previously-found proxies to avoid duplicates across runs."""
     ensure_results_dir()
-    for f in OUT_FILES.values():
-        open(f, "w", encoding="utf-8").close()
-    open(ALL_WORKING_FILE, "w", encoding="utf-8").close()
+    if os.path.exists(ALL_WORKING_FILE):
+        try:
+            with open(ALL_WORKING_FILE, "r", encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if ln:
+                        unique_proxies_found.add(ln)
+        except Exception:
+            pass
 
 def save_working(proxy_str, proto_key):
     """Append proxy_str to corresponding output file (thread-safe)."""
     with lock:
-        # Avoid writing duplicates to the ALL_WORKING file
         if proxy_str not in unique_proxies_found:
+            # Append to ALL_WORKING
             with open(ALL_WORKING_FILE, "a", encoding="utf-8") as fh:
                 fh.write(proxy_str + "\n")
             unique_proxies_found.add(proxy_str)
 
+        # Append to protocol-specific file (duplicate prevention at ALL_WORKING level)
         fname = OUT_FILES[proto_key]
         with open(fname, "a", encoding="utf-8") as fh:
             fh.write(proxy_str + "\n")
@@ -101,8 +107,6 @@ def save_working(proxy_str, proto_key):
 def run_curl(args, timeout):
     """Run curl command, return True if successful (exit 0 and stdout)."""
     try:
-        # On Windows you might use STARTUPINFO to hide console; on Linux it's not needed.
-        # We will not set startupinfo on non-Windows to keep compatibility.
         kwargs = dict(capture_output=True, text=True, timeout=timeout, check=False)
         if IS_WINDOWS:
             try:
@@ -110,16 +114,13 @@ def run_curl(args, timeout):
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 kwargs["startupinfo"] = si
             except Exception:
-                # If STARTUPINFO isn't available for any reason, ignore it.
                 pass
-
         result = subprocess.run(args, **kwargs)
-        return result.returncode == 0 and bool(result.stdout)
+        return result.returncode == 0 and bool(result.stdout and result.stdout.strip())
     except Exception:
         return False
 
 def test_http_proxy(proxy_str, timeout):
-    # -x proxy, using http scheme
     args = [curl_exe, "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "http://httpbin.org/ip"]
     return run_curl(args, timeout)
 
@@ -128,16 +129,14 @@ def test_https_proxy(proxy_str, timeout):
     return run_curl(args, timeout)
 
 def test_socks4_proxy(proxy_str, timeout):
-    # --socks4 uses socks4 proxy
     args = [curl_exe, "--socks4", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_socks5_proxy(proxy_str, timeout):
-    # --socks5-hostname resolves via proxy which often matches desired behavior
     args = [curl_exe, "--socks5-hostname", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
-# ---------- IP generation (avoid private/multicast/reserved ranges) ----------
+# ---------- IP generation ----------
 def random_public_ipv4(rng):
     while True:
         a = rng.randint(1, 223)
@@ -154,108 +153,139 @@ def random_public_ipv4(rng):
 
 # ---------- Worker ----------
 def worker_test(proxy_str, timeout):
-    """Tests a single proxy_str against all protocols and returns results."""
     result = {"proxy": proxy_str, "http": False, "https": False, "socks4": False, "socks5": False}
-    
-    # Test protocols, save if working
     if test_http_proxy(proxy_str, timeout):
         result["http"] = True
         save_working(proxy_str, "http")
-    
     if test_https_proxy(proxy_str, timeout):
         result["https"] = True
         save_working(proxy_str, "https")
-
     if test_socks4_proxy(proxy_str, timeout):
         result["socks4"] = True
         save_working(proxy_str, "socks4")
-
     if test_socks5_proxy(proxy_str, timeout):
         result["socks5"] = True
         save_working(proxy_str, "socks5")
-    
     return result
 
-# ---------- Main ----------
+# ---------- Batch run (single batch) ----------
+def run_one_batch(batch_id, count, ports_to_test, timeout, max_workers, seed):
+    rng = random.Random(seed)
+    ips = [random_public_ipv4(rng) for _ in range(count)]
+    proxies_to_test = [f"{ip}:{port}" for ip in ips for port in ports_to_test]
+    rng.shuffle(proxies_to_test)
+
+    total_combinations = len(proxies_to_test)
+    print(f"[Batch {batch_id}] Total combinations: {total_combinations} (count={count})")
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(worker_test, p, timeout): p for p in proxies_to_test}
+        for i, fut in enumerate(as_completed(futures)):
+            p = futures[fut]
+            try:
+                res = fut.result()
+                results.append(res)
+                ok = [k.upper() for k, v in res.items() if k != "proxy" and v]
+                progress = f"[{i+1}/{total_combinations}]"
+                if ok:
+                    print(f"{progress} {p:<21} -> SUCCESS: {', '.join(ok)}")
+            except Exception as exc:
+                print(f"{p} generated exception: {exc}")
+
+    # summary for this batch (append to summary file)
+    good = sum(1 for r in results if any(v for k, v in r.items() if k != "proxy"))
+    with lock:
+        with open(SUMMARY_FILE, "a", encoding="utf-8") as sf:
+            sf.write(f"Batch {batch_id} | {datetime.utcnow().isoformat()}Z | tested={len(results)} | good={good}\n")
+
+    return len(results), good
+
+# ---------- Main (loop batches until overall timeout) ----------
 def main():
-    parser = argparse.ArgumentParser(description="Generate random IPs and test multiple ports on each with curl")
-    parser.add_argument("--count", type=int, default=DEFAULT_IP_COUNT, help="Number of random IP addresses to generate and test")
+    parser = argparse.ArgumentParser(description="Batching proxy tester using curl")
+    parser.add_argument("--count", type=int, default=DEFAULT_IP_COUNT, help="IPs per batch (default 100)")
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Max concurrent workers")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Curl timeout in seconds")
-    parser.add_argument("--port-list", choices=['common', 'all', 'custom'], default='common', help="Which list of ports to test against each IP. Use 'custom' with the --ports argument.")
-    parser.add_argument("--ports", type=str, help="Comma-separated list of ports to test (required if --port-list=custom)")
-    parser.add_argument("--seed", type=int, help="Optional RNG seed for reproducible IP generation")
+    parser.add_argument("--port-list", choices=['common', 'all', 'custom'], default='common')
+    parser.add_argument("--ports", type=str, help="Comma-separated custom ports (when --port-list=custom)")
+    parser.add_argument("--seed", type=int, help="RNG seed (optional)")
+    parser.add_argument("--overall-timeout", type=int, default=DEFAULT_OVERALL_TIMEOUT, help="Overall timeout in seconds (default 24000 = 6h40m)")
+    parser.add_argument("--max-batches", type=int, default=0, help="Optional: maximum number of batches (0 = unlimited until timeout)")
     args = parser.parse_args()
 
-    # --- Validate arguments ---
     if args.port_list == 'custom' and not args.ports:
-        parser.error("--ports is required when using --port-list=custom")
+        parser.error("--ports required with --port-list=custom")
 
-    # --- Determine port list ---
-    ports_to_test = []
+    # choose port set
     if args.port_list == 'common':
         ports_to_test = COMMON_PROXY_PORTS
     elif args.port_list == 'all':
         ports_to_test = ALL_COMMON_PORTS
-    elif args.port_list == 'custom':
+    else:
         try:
             ports_to_test = [int(p.strip()) for p in args.ports.split(',') if p.strip()]
-        except ValueError:
-            print("Error: --ports must be a comma-separated list of numbers.", file=sys.stderr)
+        except Exception:
+            print("Error: --ports must be comma-separated integers", file=sys.stderr)
             return
 
-    rng = random.Random(args.seed)
-
-    # --- Generate IPs and create all test combinations ---
+    ensure_results_dir()
+    load_existing_proxies()  # do not remove previous results; avoid duplicates
+    print(f"Starting batch-run; existing unique proxies loaded: {len(unique_proxies_found)}")
     print(f"Using curl executable: {curl_exe}")
-    print(f"Generating {args.count} random IPs and testing against {len(ports_to_test)} ports each.")
-    ips = [random_public_ipv4(rng) for _ in range(args.count)]
-    proxies_to_test = [f"{ip}:{port}" for ip in ips for port in ports_to_test]
-    
-    # Shuffle to distribute requests across different IPs
-    rng.shuffle(proxies_to_test)
-    
-    total_combinations = len(proxies_to_test)
-    print(f"Total combinations to test: {total_combinations}")
-    print(f"Using max_workers={args.max_workers}, timeout={args.timeout}s, seed={args.seed}")
+    start_time = time.time()
+    batch_id = 0
+    total_tested = 0
+    total_good = 0
 
-    clear_output_files()
-
-    results = []
     try:
-        with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-            futures = {ex.submit(worker_test, p, args.timeout): p for p in proxies_to_test}
-            
-            for i, fut in enumerate(as_completed(futures)):
-                p = futures[fut]
-                try:
-                    res = fut.result()
-                    results.append(res)
-                    ok = [k.upper() for k, v in res.items() if k != "proxy" and v]
-                    
-                    # Show progress and result
-                    progress = f"[{i+1}/{total_combinations}]"
-                    if ok:
-                        print(f"{progress} {p:<21} -> SUCCESS: {', '.join(ok)}")
+        while True:
+            batch_id += 1
+            batch_start = time.time()
 
-                except Exception as exc:
-                    print(f"{p} generated exception: {exc}")
+            # Run a single batch
+            tested, good = run_one_batch(batch_id, args.count, ports_to_test, args.timeout, args.max_workers, args.seed)
+            total_tested += tested
+            total_good += good
+
+            elapsed = time.time() - start_time
+            batch_elapsed = time.time() - batch_start
+            remaining = args.overall_timeout - elapsed
+
+            print(f"[Batch {batch_id}] finished in {int(batch_elapsed)}s; total elapsed {int(elapsed)}s; remaining {int(remaining)}s")
+            # If max_batches set and reached -> stop
+            if args.max_batches and batch_id >= args.max_batches:
+                print(f"Reached max_batches={args.max_batches}; stopping.")
+                break
+
+            # If no time left, stop
+            if remaining <= 0:
+                print("Overall timeout reached; stopping further batches.")
+                break
+
+            # If we don't have enough remaining time for another reasonable batch,
+            # stop. (We allow a small safety margin of 30s.)
+            # Decision: if remaining <= 30s, break.
+            if remaining <= 30:
+                print("Not enough time remaining for another batch; stopping.")
+                break
+
+            # Otherwise, continue to next batch (immediately)
+            print(f"Starting next batch (batch {batch_id+1})...")
+
     except KeyboardInterrupt:
-        print("KeyboardInterrupt received — shutting down workers...")
+        print("KeyboardInterrupt received — exiting gracefully.")
 
-    # --- Summary ---
-    total_tested = len(results)
-    good = sum(1 for r in results if any(v for k, v in r.items() if k != "proxy"))
-    print(f"\nTest complete. Tested {total_tested} IP:port combinations.")
-    print(f"Found {good} working proxy connections from {len(unique_proxies_found)} unique IPs.")
+    # Overall summary
+    elapsed_total = time.time() - start_time
+    print("\nOverall run complete.")
+    print(f"Total batches: {batch_id}")
+    print(f"Total tested combos: {total_tested}")
+    print(f"Total good proxies found (unique): {len(unique_proxies_found)}")
+    print(f"Elapsed time: {int(elapsed_total)}s")
 
-    for proto, fname in OUT_FILES.items():
-        try:
-            with open(fname, "r", encoding="utf-8") as fh:
-                count = sum(1 for _ in fh)
-            print(f"  {proto.upper():6}: {count} saved -> {fname}")
-        except Exception:
-            print(f"  {proto.upper():6}: error reading {fname}")
+    with open(SUMMARY_FILE, "a", encoding="utf-8") as sf:
+        sf.write(f"Overall | {datetime.utcnow().isoformat()}Z | batches={batch_id} | tested={total_tested} | unique_good={len(unique_proxies_found)} | elapsed_s={int(elapsed_total)}\n")
 
 if __name__ == "__main__":
     main()
