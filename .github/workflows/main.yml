@@ -1,1 +1,40 @@
+name: Run Ptester
+
+on:
+  push:        # Run after every push
+    branches:
+      - main   # Change if your default branch is different
+  workflow_dispatch:  # Allow manual trigger from GitHub Actions tab
+
+jobs:
+  run-ptester:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # Change to your required Python version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Add any needed packages here, example:
+          # pip install requests aiohttp urllib3
+
+      - name: Run Ptester.py
+        run: |
+          python Ptester.py
+
+      - name: Upload generated files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ptester-results
+          path: |
+            **/*.txt
+            **/*.log
+            output/**
 
