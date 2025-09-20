@@ -36,7 +36,7 @@ jobs:
         id: run_ptester
         continue-on-error: true
         run: |
-          timeout 20400s python proxy_tester_curl_multiport.py --count 200 --max-workers 50 --timeout 3
+          timeout 20400s python Ptester.py --count 200 --max-workers 50 --timeout 3
           rc=$?; echo "rc=$rc"; if [ $rc -eq 124 ]; then echo "timed_out=true" >> $GITHUB_OUTPUT; fi
 
       - name: Ensure results summary exists
