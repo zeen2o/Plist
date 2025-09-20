@@ -1,23 +1,13 @@
-# proxy_tester_curl_multiport.py
+#!/usr/bin/env python3
 """
-Generate random IP addresses and test a list of common ports on each IP
-for proxy connectivity using curl.
+Cross-platform proxy tester using curl (works on Windows and Ubuntu/GitHub Actions).
 
-Protocols Tested:
-  - HTTP (http://httpbin.org/ip)
-  - HTTPS (https://httpbin.org/ip)
-  - SOCKS4 (https://httpbin.org/ip)
-  - SOCKS5 (https://httpbin.org/ip)
-
-Usage examples:
-  # Test 200 IPs against the small list of common ports
-  python proxy_tester_curl_multiport.py --count 200
-
-  # Test 50 IPs against the large list of all known common ports
-  python proxy_tester_curl_multiport.py --count 50 --port-list all --max-workers 50
-
-  # Test 100 IPs against a custom list of ports
-  python proxy_tester_curl_multiport.py --count 100 --port-list custom --ports 80,8080,8888
+Writes outputs into the `results/` folder:
+  results/HTTP.txt
+  results/HTTPS.txt
+  results/SOCKS4.txt
+  results/SOCKS5.txt
+  results/ALL_WORKING.txt
 """
 
 import os
@@ -26,19 +16,25 @@ import argparse
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
+import shutil
+import platform
+import sys
 
 # ---------- Config / defaults ----------
 DEFAULT_IP_COUNT = 200
 DEFAULT_TIMEOUT = 3
-DEFAULT_MAX_WORKERS = 100
+# Lowered default a bit for CI runners (adjust as needed)
+DEFAULT_MAX_WORKERS = 50
+
+RESULTS_DIR = "results"
 
 OUT_FILES = {
-    "http": "HTTP.txt",
-    "https": "HTTPS.txt",
-    "socks4": "SOCKS4.txt",
-    "socks5": "SOCKS5.txt",
+    "http": os.path.join(RESULTS_DIR, "HTTP.txt"),
+    "https": os.path.join(RESULTS_DIR, "HTTPS.txt"),
+    "socks4": os.path.join(RESULTS_DIR, "SOCKS4.txt"),
+    "socks5": os.path.join(RESULTS_DIR, "SOCKS5.txt"),
 }
-ALL_WORKING_FILE = "ALL_WORKING.txt"
+ALL_WORKING_FILE = os.path.join(RESULTS_DIR, "ALL_WORKING.txt")
 
 # --- Port Lists ---
 COMMON_PROXY_PORTS = [80, 8080, 3128, 1080, 9050, 8888, 8118, 8000]
@@ -58,15 +54,33 @@ ALT_SOCKS_PORTS = [
     7777, 7788, 7900, 8009, 8118, 8201, 8281, 8388, 8444, 8688, 8808, 8881, 9002,
     9091, 9101, 9300, 9998
 ]
-# Combined list for the 'all' option
 ALL_COMMON_PORTS = sorted(list(set(COMMON_PROXY_PORTS + ALT_HTTP_PORTS + ALT_SOCKS_PORTS)))
-
 
 lock = threading.Lock()
 unique_proxies_found = set()
 
+# ---------- Platform / curl detection ----------
+IS_WINDOWS = platform.system().lower().startswith("windows")
+# prefer native curl if available
+CURL_CANDIDATES = ["curl", "curl.exe"]
+curl_exe = None
+for c in CURL_CANDIDATES:
+    path = shutil.which(c)
+    if path:
+        curl_exe = path
+        break
+
+if not curl_exe:
+    print("Error: curl not found on PATH. Please install curl on the runner (e.g. apt-get install -y curl).", file=sys.stderr)
+    # Exit non-zero so CI shows failure — user can change this behavior
+    sys.exit(2)
+
 # ---------- Helpers ----------
+def ensure_results_dir():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
 def clear_output_files():
+    ensure_results_dir()
     for f in OUT_FILES.values():
         open(f, "w", encoding="utf-8").close()
     open(ALL_WORKING_FILE, "w", encoding="utf-8").close()
@@ -87,31 +101,40 @@ def save_working(proxy_str, proto_key):
 def run_curl(args, timeout):
     """Run curl command, return True if successful (exit 0 and stdout)."""
     try:
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
-            startupinfo=startupinfo, check=False
-        )
+        # On Windows you might use STARTUPINFO to hide console; on Linux it's not needed.
+        # We will not set startupinfo on non-Windows to keep compatibility.
+        kwargs = dict(capture_output=True, text=True, timeout=timeout, check=False)
+        if IS_WINDOWS:
+            try:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                kwargs["startupinfo"] = si
+            except Exception:
+                # If STARTUPINFO isn't available for any reason, ignore it.
+                pass
+
+        result = subprocess.run(args, **kwargs)
         return result.returncode == 0 and bool(result.stdout)
     except Exception:
         return False
 
 def test_http_proxy(proxy_str, timeout):
-    args = ["curl", "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "http://httpbin.org/ip"]
+    # -x proxy, using http scheme
+    args = [curl_exe, "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "http://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_https_proxy(proxy_str, timeout):
-    args = ["curl", "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "https://httpbin.org/ip"]
+    args = [curl_exe, "-x", f"http://{proxy_str}", "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_socks4_proxy(proxy_str, timeout):
-    args = ["curl", "--socks4", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
+    # --socks4 uses socks4 proxy
+    args = [curl_exe, "--socks4", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 def test_socks5_proxy(proxy_str, timeout):
-    args = ["curl", "--socks5-hostname", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
+    # --socks5-hostname resolves via proxy which often matches desired behavior
+    args = [curl_exe, "--socks5-hostname", proxy_str, "-s", "-m", str(timeout), "https://httpbin.org/ip"]
     return run_curl(args, timeout)
 
 # ---------- IP generation (avoid private/multicast/reserved ranges) ----------
@@ -178,17 +201,18 @@ def main():
         try:
             ports_to_test = [int(p.strip()) for p in args.ports.split(',') if p.strip()]
         except ValueError:
-            print("Error: --ports must be a comma-separated list of numbers.")
+            print("Error: --ports must be a comma-separated list of numbers.", file=sys.stderr)
             return
 
     rng = random.Random(args.seed)
 
     # --- Generate IPs and create all test combinations ---
+    print(f"Using curl executable: {curl_exe}")
     print(f"Generating {args.count} random IPs and testing against {len(ports_to_test)} ports each.")
     ips = [random_public_ipv4(rng) for _ in range(args.count)]
     proxies_to_test = [f"{ip}:{port}" for ip in ips for port in ports_to_test]
     
-    # Shuffle to distribute requests across different IPs, not hitting one IP repeatedly
+    # Shuffle to distribute requests across different IPs
     rng.shuffle(proxies_to_test)
     
     total_combinations = len(proxies_to_test)
@@ -198,26 +222,26 @@ def main():
     clear_output_files()
 
     results = []
-    with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-        futures = {ex.submit(worker_test, p, args.timeout): p for p in proxies_to_test}
-        
-        for i, fut in enumerate(as_completed(futures)):
-            p = futures[fut]
-            try:
-                res = fut.result()
-                results.append(res)
-                ok = [k.upper() for k, v in res.items() if k != "proxy" and v]
-                
-                # Show progress and result
-                progress = f"[{i+1}/{total_combinations}]"
-                if ok:
-                    print(f"{progress} {p:<21} -> SUCCESS: {', '.join(ok)}")
-                # To reduce noise, we can optionally hide failures
-                # else:
-                #     print(f"{progress} {p:<21} -> NONE")
+    try:
+        with ThreadPoolExecutor(max_workers=args.max_workers) as ex:
+            futures = {ex.submit(worker_test, p, args.timeout): p for p in proxies_to_test}
+            
+            for i, fut in enumerate(as_completed(futures)):
+                p = futures[fut]
+                try:
+                    res = fut.result()
+                    results.append(res)
+                    ok = [k.upper() for k, v in res.items() if k != "proxy" and v]
+                    
+                    # Show progress and result
+                    progress = f"[{i+1}/{total_combinations}]"
+                    if ok:
+                        print(f"{progress} {p:<21} -> SUCCESS: {', '.join(ok)}")
 
-            except Exception as exc:
-                print(f"{p} generated exception: {exc}")
+                except Exception as exc:
+                    print(f"{p} generated exception: {exc}")
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received — shutting down workers...")
 
     # --- Summary ---
     total_tested = len(results)
