@@ -1,15 +1,19 @@
-name: Run Ptester with Timeout
+name: Run Ptester and Commit Results
+
+# ensure the workflow has permission to push back to the repo
+permissions:
+  contents: write
 
 on:
   push:
     branches:
-      - main
+      - main    # change branch if needed
   workflow_dispatch:
 
 jobs:
   run-ptester:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # whole job limit safeguard (6h)
+    timeout-minutes: 360   # job timeout (6 hours) — larger than the script timeout
 
     steps:
       - name: Checkout repository
@@ -26,28 +30,65 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # Add your dependencies here, e.g.:
           # pip install requests aiohttp urllib3
 
-      - name: Run Ptester.py (with 5h40m limit)
+      - name: Run Ptester.py with timeout (5h40m)
+        id: run_ptester
+        continue-on-error: true
         run: |
-          timeout 20400s python Ptester.py || echo "Ptester stopped due to timeout"
-        # 20400s = 5 hours 40 minutes
+          set -o pipefail
+          echo "Starting Ptester.py (timeout after 5h40m = 20400s)..."
+          # Run Ptester.py but kill it after 20400 seconds (5 hours 40 minutes).
+          # GNU timeout returns 124 when it terminates the command.
+          timeout 20400s python Ptester.py
+          rc=$?
+          echo "Ptester exit code: $rc"
+          if [ $rc -eq 124 ]; then
+            echo "script_timed_out=true" >> $GITHUB_OUTPUT
+            echo "Ptester timed out after 5h40m"
+          elif [ $rc -ne 0 ]; then
+            echo "script_failed=true" >> $GITHUB_OUTPUT
+            echo "Ptester exited with code $rc"
+          else
+            echo "script_succeeded=true" >> $GITHUB_OUTPUT
+            echo "Ptester finished successfully"
+          fi
 
       - name: Upload generated files as artifact
-        if: always()   # runs even if timeout happens
         uses: actions/upload-artifact@v4
         with:
           name: ptester-results
           path: |
-            **/*.txt
-            **/*.log
+            '**/*.txt'
+            '**/*.log'
             output/**
+            generated/**
 
-      - name: Commit and push generated files
-        if: always()   # ensure push even on timeout
+      - name: Commit and push generated files to same branch
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
+          # Configure git user (GitHub Actions bot)
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "Partial results from Ptester.py (timeout-safe) [skip ci]" || echo "No changes to commit"
-          git push origin HEAD:${{ github.ref_name }}
+
+          # Try to stage typical generated file locations only (so we don't accidentally commit unrelated changes)
+          # Enable recursive globbing (for **)
+          shopt -s globstar || true
+
+          # Stage common generated patterns - adjust these to match your script's outputs
+          git add --force output || true
+          git add --force generated || true
+          git add --force -- **/*.txt **/*.log || true
+
+          # If there are no staged changes, exit gracefully
+          if git diff --cached --quiet; then
+            echo "No generated files to commit."
+            exit 0
+          fi
+
+          # Commit and push. Include [skip ci] to avoid retriggering workflows.
+          git commit -m "Add generated results from Ptester.py [skip ci]" || echo "Commit failed or no changes"
+          # Push back to the same branch that triggered the workflow
+          git push origin HEAD:${GITHUB_REF_NAME}
